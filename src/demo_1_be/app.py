@@ -2,8 +2,16 @@ import os
 import json
 import uuid
 import logging
+import sys
+from pathlib import Path
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from app.core.logging import configure_logging
 
 from fastapi import (
     FastAPI,
@@ -17,6 +25,12 @@ from pydantic import BaseModel
 from openai import AsyncOpenAI
 from pymongo import AsyncMongoClient, ASCENDING, DESCENDING
 from dotenv import load_dotenv
+
+from app.api.routes.knowledge import router as knowledge_router
+from app.core.config import MONGODB_DATABASE, MONGODB_URL
+from app.repositories.knowledge_repository import KnowledgeRepository
+from app.services.embedding_service import EmbeddingService
+from app.services.knowledge_retrieval import KnowledgeRetrievalService
 
 
 # ============================================================
@@ -39,14 +53,16 @@ MONGODB_DATABASE = os.getenv(
     "ai_chatbot"
 )
 
+EMBEDDING_BASE_URL = os.getenv("EMBEDDING_BASE_URL") or os.getenv("OPENAI_BASE_URL")
+EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY") or os.getenv("OPENAI_API_KEY")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL") or os.getenv("OPENAI_MODEL")
+
 
 # ============================================================
 # Logging
 # ============================================================
 
-logging.basicConfig(level=logging.INFO)
-
-logger = logging.getLogger(__name__)
+logger = configure_logging()
 
 
 # ============================================================
@@ -78,6 +94,7 @@ Follow these guidelines:
 mongo_client = None
 db = None
 llm_client = None
+knowledge_retrieval_service = None
 
 
 # ============================================================
@@ -145,6 +162,7 @@ async def lifespan(app: FastAPI):
     global mongo_client
     global db
     global llm_client
+    global knowledge_retrieval_service
 
     # --------------------------------------------------------
     # MongoDB
@@ -195,6 +213,21 @@ async def lifespan(app: FastAPI):
         base_url=OPENAI_BASE_URL
     )
 
+    try:
+        knowledge_repository = KnowledgeRepository(mongo_client, MONGODB_DATABASE)
+        embedding_service = EmbeddingService(
+            api_key=EMBEDDING_API_KEY,
+            base_url=EMBEDDING_BASE_URL,
+            model=EMBEDDING_MODEL,
+        )
+        knowledge_retrieval_service = KnowledgeRetrievalService(
+            repository=knowledge_repository,
+            embedding_service=embedding_service,
+        )
+    except Exception as exc:
+        logger.warning("Knowledge retrieval service initialization failed: %s", exc)
+        knowledge_retrieval_service = None
+
     logger.info(
         "LLM configured: model=%s base_url=%s stream=%s",
         OPENAI_MODEL,
@@ -223,6 +256,8 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
+
+app.include_router(knowledge_router)
 
 
 # ============================================================
@@ -807,6 +842,31 @@ async def websocket_endpoint(
                 }
             ]
 
+            knowledge_context = ""
+
+            if knowledge_retrieval_service:
+                try:
+                    logger.info("Starting knowledge retrieval for chat question: %s", user_content[:200])
+                    knowledge_context = await knowledge_retrieval_service.retrieve(user_content)
+                    if knowledge_context:
+                        logger.info("Knowledge retrieval returned %d chars of context for question: %s", len(knowledge_context), user_content[:200])
+                    else:
+                        logger.info("Knowledge retrieval returned no context for question: %s", user_content[:200])
+                except Exception as exc:
+                    logger.warning("Knowledge retrieval failed for chat query: %s", exc, exc_info=True)
+                    knowledge_context = ""
+
+            if knowledge_context:
+                history.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "Use the following internal knowledge as context when relevant. "
+                            "If the answer is not in the context, say that clearly and answer from general knowledge only.\n\n"
+                            f"{knowledge_context}"
+                        )
+                    }
+                )
 
             async for message in cursor:
 
