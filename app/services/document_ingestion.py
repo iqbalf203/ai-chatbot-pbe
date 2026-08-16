@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -14,6 +16,8 @@ from app.services.document_parser import (
     validate_file,
 )
 from app.services.embedding_service import EmbeddingService
+
+logger = logging.getLogger("demo_1_be.ingestion")
 
 
 class DocumentIngestionService:
@@ -35,7 +39,7 @@ class DocumentIngestionService:
     def current_timestamp() -> datetime:
         return datetime.now(timezone.utc)
 
-    async def ingest(self, file: UploadFile) -> dict[str, Any]:
+    async def ingest(self, file: UploadFile, tenant_id: str | None = None) -> dict[str, Any]:
         validate_file(file, max_size_bytes=self.max_file_size_bytes)
 
         try:
@@ -76,8 +80,12 @@ class DocumentIngestionService:
                         "source_file_type": file.filename.rsplit(".", 1)[-1].lower(),
                         "chunk_size": self.chunk_size,
                         "chunk_overlap": self.chunk_overlap,
+                        "tenant_id": tenant_id or "default",
+                        "status": "active",
                         "created_at": self.current_timestamp().isoformat(),
                     },
+                    "tenant_id": tenant_id or "default",
+                    "status": "active",
                     "created_at": self.current_timestamp(),
                 }
             )
@@ -85,9 +93,38 @@ class DocumentIngestionService:
         await self.repository.ensure_indexes()
         await self.repository.insert_chunks(saved_chunks)
 
+        asyncio.create_task(
+            self._background_ingestion_job(
+                document_id=document_id,
+                filename=file.filename,
+                chunks_created=len(saved_chunks),
+                tenant_id=tenant_id,
+            )
+        )
+
         return {
             "document_id": document_id,
             "filename": file.filename,
             "chunks_created": len(saved_chunks),
             "status": "completed",
         }
+
+    async def _background_ingestion_job(
+        self,
+        document_id: str,
+        filename: str | None,
+        chunks_created: int,
+        tenant_id: str | None,
+    ) -> None:
+        await asyncio.sleep(0)
+        logger.info(
+            "Background ingestion job completed",
+            extra={
+                "component": "ingestion_job",
+                "status": "completed",
+                "document_id": document_id,
+                "filename": filename,
+                "tenant_id": tenant_id or "default",
+                "chunks_created": chunks_created,
+            },
+        )

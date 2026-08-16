@@ -3,9 +3,12 @@ import json
 import uuid
 import logging
 import sys
+import time
+import asyncio
 from pathlib import Path
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
+from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
@@ -14,6 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from app.core.logging import configure_logging
 
 from fastapi import (
+    Depends,
     FastAPI,
     WebSocket,
     WebSocketDisconnect,
@@ -26,8 +30,11 @@ from openai import AsyncOpenAI
 from pymongo import AsyncMongoClient, ASCENDING, DESCENDING
 from dotenv import load_dotenv
 
+from app.api.routes.auth import router as auth_router
 from app.api.routes.knowledge import router as knowledge_router
 from app.core.config import MONGODB_DATABASE, MONGODB_URL
+from app.core.security import get_current_user
+from app.core.telemetry import AppMetrics, REQUEST_ID, TENANT_ID
 from app.repositories.knowledge_repository import KnowledgeRepository
 from app.services.embedding_service import EmbeddingService
 from app.services.knowledge_retrieval import KnowledgeRetrievalService
@@ -48,14 +55,26 @@ OPENAI_STREAM = (
 )
 
 MONGODB_URL = os.getenv("MONGODB_URL")
+
 MONGODB_DATABASE = os.getenv(
     "MONGODB_DATABASE",
     "ai_chatbot"
 )
 
-EMBEDDING_BASE_URL = os.getenv("EMBEDDING_BASE_URL") or os.getenv("OPENAI_BASE_URL")
-EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY") or os.getenv("OPENAI_API_KEY")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL") or os.getenv("OPENAI_MODEL")
+EMBEDDING_BASE_URL = (
+    os.getenv("EMBEDDING_BASE_URL")
+    or os.getenv("OPENAI_BASE_URL")
+)
+
+EMBEDDING_API_KEY = (
+    os.getenv("EMBEDDING_API_KEY")
+    or os.getenv("OPENAI_API_KEY")
+)
+
+EMBEDDING_MODEL = (
+    os.getenv("EMBEDDING_MODEL")
+    or os.getenv("OPENAI_MODEL")
+)
 
 
 # ============================================================
@@ -143,9 +162,13 @@ def serialize_message(document):
     return {
         "id": document["id"],
         "conversation_id": document["conversation_id"],
+        "user_id": document.get("user_id"),
         "role": document["role"],
         "content": document["content"],
-        "format": document.get("format", "markdown"),
+        "format": document.get(
+            "format",
+            "markdown"
+        ),
         "created_at": serialize_datetime(
             document["created_at"]
         ),
@@ -191,16 +214,25 @@ async def lifespan(app: FastAPI):
     # MongoDB indexes
     # --------------------------------------------------------
 
+    await db.users.create_index(
+        [
+            ("email", ASCENDING),
+        ],
+        unique=True,
+    )
+
     await db.conversations.create_index(
         [
-            ("updated_at", DESCENDING)
+            ("user_id", ASCENDING),
+            ("updated_at", DESCENDING),
         ]
     )
 
     await db.messages.create_index(
         [
             ("conversation_id", ASCENDING),
-            ("created_at", ASCENDING)
+            ("user_id", ASCENDING),
+            ("created_at", ASCENDING),
         ]
     )
 
@@ -213,19 +245,37 @@ async def lifespan(app: FastAPI):
         base_url=OPENAI_BASE_URL
     )
 
+    # --------------------------------------------------------
+    # Knowledge retrieval
+    # --------------------------------------------------------
+
     try:
-        knowledge_repository = KnowledgeRepository(mongo_client, MONGODB_DATABASE)
+
+        knowledge_repository = KnowledgeRepository(
+            mongo_client,
+            MONGODB_DATABASE
+        )
+
         embedding_service = EmbeddingService(
             api_key=EMBEDDING_API_KEY,
             base_url=EMBEDDING_BASE_URL,
             model=EMBEDDING_MODEL,
         )
-        knowledge_retrieval_service = KnowledgeRetrievalService(
-            repository=knowledge_repository,
-            embedding_service=embedding_service,
+
+        knowledge_retrieval_service = (
+            KnowledgeRetrievalService(
+                repository=knowledge_repository,
+                embedding_service=embedding_service,
+            )
         )
+
     except Exception as exc:
-        logger.warning("Knowledge retrieval service initialization failed: %s", exc)
+
+        logger.warning(
+            "Knowledge retrieval service initialization failed: %s",
+            exc
+        )
+
         knowledge_retrieval_service = None
 
     logger.info(
@@ -244,7 +294,9 @@ async def lifespan(app: FastAPI):
     if mongo_client:
         await mongo_client.close()
 
-    logger.info("Application shutdown complete")
+    logger.info(
+        "Application shutdown complete"
+    )
 
 
 # ============================================================
@@ -257,6 +309,7 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+app.include_router(auth_router)
 app.include_router(knowledge_router)
 
 
@@ -290,6 +343,11 @@ class UpdateConversationRequest(BaseModel):
 class UserMessageRequest(BaseModel):
 
     content: str
+    message_id: str | None = None
+
+
+class StopRequest(BaseModel):
+
     message_id: str | None = None
 
 
@@ -361,7 +419,8 @@ async def health():
     status_code=status.HTTP_201_CREATED
 )
 async def create_conversation(
-    request: CreateConversationRequest
+    request: CreateConversationRequest,
+    current_user: dict = Depends(get_current_user),
 ):
 
     conversation_id = generate_id()
@@ -375,6 +434,7 @@ async def create_conversation(
 
     document = {
         "id": conversation_id,
+        "user_id": current_user["sub"],
         "title": title,
         "created_at": now,
         "updated_at": now,
@@ -399,12 +459,21 @@ async def create_conversation(
 # ============================================================
 
 @app.get("/api/conversations")
-async def get_conversations():
+async def get_conversations(
+    current_user: dict = Depends(get_current_user)
+):
 
     cursor = (
         db.conversations
-        .find({})
-        .sort("updated_at", DESCENDING)
+        .find(
+            {
+                "user_id": current_user["sub"]
+            }
+        )
+        .sort(
+            "updated_at",
+            DESCENDING
+        )
     )
 
     conversations = []
@@ -430,13 +499,15 @@ async def get_conversations():
     "/api/conversations/{conversation_id}"
 )
 async def get_conversation(
-    conversation_id: str
+    conversation_id: str,
+    current_user: dict = Depends(get_current_user),
 ):
 
     conversation = await (
         db.conversations.find_one(
             {
-                "id": conversation_id
+                "id": conversation_id,
+                "user_id": current_user["sub"],
             }
         )
     )
@@ -462,7 +533,8 @@ async def get_conversation(
 )
 async def update_conversation(
     conversation_id: str,
-    request: UpdateConversationRequest
+    request: UpdateConversationRequest,
+    current_user: dict = Depends(get_current_user),
 ):
 
     title = request.title.strip()
@@ -477,7 +549,8 @@ async def update_conversation(
     result = await (
         db.conversations.update_one(
             {
-                "id": conversation_id
+                "id": conversation_id,
+                "user_id": current_user["sub"],
             },
             {
                 "$set": {
@@ -516,13 +589,15 @@ async def update_conversation(
     "/api/conversations/{conversation_id}"
 )
 async def delete_conversation(
-    conversation_id: str
+    conversation_id: str,
+    current_user: dict = Depends(get_current_user),
 ):
 
     result = await (
         db.conversations.delete_one(
             {
-                "id": conversation_id
+                "id": conversation_id,
+                "user_id": current_user["sub"],
             }
         )
     )
@@ -539,7 +614,8 @@ async def delete_conversation(
 
     await db.messages.delete_many(
         {
-            "conversation_id": conversation_id
+            "conversation_id": conversation_id,
+            "user_id": current_user["sub"],
         }
     )
 
@@ -562,13 +638,19 @@ async def delete_conversation(
     "/api/conversations/{conversation_id}/messages"
 )
 async def get_messages(
-    conversation_id: str
+    conversation_id: str,
+    current_user: dict = Depends(get_current_user),
 ):
+
+    # --------------------------------------------------------
+    # Verify conversation belongs to current user
+    # --------------------------------------------------------
 
     conversation = await (
         db.conversations.find_one(
             {
-                "id": conversation_id
+                "id": conversation_id,
+                "user_id": current_user["sub"],
             }
         )
     )
@@ -580,14 +662,22 @@ async def get_messages(
             detail="Conversation not found."
         )
 
+    # --------------------------------------------------------
+    # Fetch messages
+    # --------------------------------------------------------
+
     cursor = (
         db.messages
         .find(
             {
-                "conversation_id": conversation_id
+                "conversation_id": conversation_id,
+                "user_id": current_user["sub"],
             }
         )
-        .sort("created_at", ASCENDING)
+        .sort(
+            "created_at",
+            ASCENDING
+        )
     )
 
     messages = []
@@ -607,6 +697,26 @@ async def get_messages(
 
 
 # ============================================================
+# ACTIVE STREAMS
+# ============================================================
+
+ACTIVE_STREAMS: dict[
+    str,
+    dict[str, Any]
+] = {}
+
+
+# ============================================================
+# METRICS
+# ============================================================
+
+@app.get("/metrics")
+async def metrics_endpoint():
+
+    return AppMetrics.snapshot()
+
+
+# ============================================================
 # WEBSOCKET CHAT
 # ============================================================
 
@@ -616,6 +726,15 @@ async def websocket_endpoint(
 ):
 
     await websocket.accept()
+
+    request_id = generate_id()
+
+    REQUEST_ID.set(request_id)
+    TENANT_ID.set("default")
+
+    # --------------------------------------------------------
+    # Conversation ID
+    # --------------------------------------------------------
 
     conversation_id = (
         websocket.query_params
@@ -640,7 +759,6 @@ async def websocket_endpoint(
         )
 
         return
-
 
     # --------------------------------------------------------
     # Verify conversation
@@ -670,12 +788,19 @@ async def websocket_endpoint(
 
         return
 
+    # --------------------------------------------------------
+    # User ID comes from the conversation
+    #
+    # WebSocket authentication is intentionally NOT used.
+    # --------------------------------------------------------
+
+    user_id = conversation.get("user_id")
 
     logger.info(
-        "WebSocket connected for conversation: %s",
-        conversation_id
+        "WebSocket connected for conversation=%s user=%s",
+        conversation_id,
+        user_id
     )
-
 
     try:
 
@@ -689,6 +814,9 @@ async def websocket_endpoint(
                 websocket.receive_text()
             )
 
+            # =================================================
+            # Parse JSON
+            # =================================================
 
             try:
 
@@ -708,12 +836,56 @@ async def websocket_endpoint(
 
                 continue
 
+            # =================================================
+            # Stop generation
+            # =================================================
+
+            if payload.get(
+                "type"
+            ) == "stop_generation":
+
+                message_id = payload.get(
+                    "message_id"
+                )
+
+                if (
+                    message_id
+                    and message_id in ACTIVE_STREAMS
+                ):
+
+                    task = (
+                        ACTIVE_STREAMS[
+                            message_id
+                        ].get("task")
+                    )
+
+                    ACTIVE_STREAMS[
+                        message_id
+                    ]["cancelled"] = True
+
+                    if (
+                        task
+                        and not task.done()
+                    ):
+
+                        task.cancel()
+
+                    await send_event(
+                        websocket,
+                        "generation_stopped",
+                        message_id,
+                        status="stopped",
+                    )
+
+                continue
 
             # =================================================
             # Validate message type
             # =================================================
 
-            if payload.get("type") != "user_message":
+            if payload.get(
+                "type"
+            ) != "user_message":
 
                 await send_event(
                     websocket,
@@ -728,12 +900,15 @@ async def websocket_endpoint(
 
                 continue
 
+            # =================================================
+            # Extract user content
+            # =================================================
 
             user_content = (
-                payload.get("content", "")
+                payload
+                .get("content", "")
                 .strip()
             )
-
 
             if not user_content:
 
@@ -749,12 +924,16 @@ async def websocket_endpoint(
 
                 continue
 
+            # =================================================
+            # Message ID
+            # =================================================
 
             user_message_id = (
-                payload.get("message_id")
+                payload.get(
+                    "message_id"
+                )
                 or generate_id()
             )
-
 
             # =================================================
             # Persist USER message
@@ -762,24 +941,41 @@ async def websocket_endpoint(
 
             user_message = {
                 "id": user_message_id,
-                "conversation_id": conversation_id,
+
+                "conversation_id":
+                    conversation_id,
+
+                # NEW
+                "user_id":
+                    user_id,
+
                 "role": "user",
-                "content": user_content,
-                "format": "markdown",
-                "created_at": timestamp()
+
+                "content":
+                    user_content,
+
+                "format":
+                    "markdown",
+
+                "created_at":
+                    timestamp()
             }
 
             await db.messages.insert_one(
                 user_message
             )
 
+            logger.info(
+                "User message stored: "
+                "message=%s conversation=%s user=%s",
+                user_message_id,
+                conversation_id,
+                user_id
+            )
 
             # =================================================
             # Update conversation
             # =================================================
-
-            # Automatically create a useful title
-            # from the first user message.
 
             if conversation["title"] == "New Chat":
 
@@ -788,33 +984,43 @@ async def websocket_endpoint(
                 )
 
                 if len(user_content) > 50:
+
                     generated_title += "..."
 
                 await db.conversations.update_one(
                     {
-                        "id": conversation_id
+                        "id":
+                            conversation_id
                     },
                     {
                         "$set": {
-                            "title": generated_title,
-                            "updated_at": timestamp()
+                            "title":
+                                generated_title,
+
+                            "updated_at":
+                                timestamp()
                         }
                     }
+                )
+
+                conversation["title"] = (
+                    generated_title
                 )
 
             else:
 
                 await db.conversations.update_one(
                     {
-                        "id": conversation_id
+                        "id":
+                            conversation_id
                     },
                     {
                         "$set": {
-                            "updated_at": timestamp()
+                            "updated_at":
+                                timestamp()
                         }
                     }
                 )
-
 
             # =================================================
             # Load conversation history
@@ -834,49 +1040,99 @@ async def websocket_endpoint(
                 )
             )
 
-
             history = [
                 {
                     "role": "system",
-                    "content": SYSTEM_PROMPT
+                    "content":
+                        SYSTEM_PROMPT
                 }
             ]
+
+            # =================================================
+            # Knowledge retrieval
+            # =================================================
 
             knowledge_context = ""
 
             if knowledge_retrieval_service:
+
                 try:
-                    logger.info("Starting knowledge retrieval for chat question: %s", user_content[:200])
-                    knowledge_context = await knowledge_retrieval_service.retrieve(user_content)
+
+                    logger.info(
+                        "Starting knowledge retrieval "
+                        "for chat question: %s",
+                        user_content[:200]
+                    )
+
+                    knowledge_context = (
+                        await knowledge_retrieval_service.retrieve(
+                            user_content
+                        )
+                    )
+
                     if knowledge_context:
-                        logger.info("Knowledge retrieval returned %d chars of context for question: %s", len(knowledge_context), user_content[:200])
+
+                        logger.info(
+                            "Knowledge retrieval returned "
+                            "%d chars of context for question: %s",
+                            len(knowledge_context),
+                            user_content[:200]
+                        )
+
                     else:
-                        logger.info("Knowledge retrieval returned no context for question: %s", user_content[:200])
+
+                        logger.info(
+                            "Knowledge retrieval returned "
+                            "no context for question: %s",
+                            user_content[:200]
+                        )
+
                 except Exception as exc:
-                    logger.warning("Knowledge retrieval failed for chat query: %s", exc, exc_info=True)
+
+                    logger.warning(
+                        "Knowledge retrieval failed "
+                        "for chat query: %s",
+                        exc,
+                        exc_info=True
+                    )
+
                     knowledge_context = ""
 
+            # =================================================
+            # Add knowledge context
+            # =================================================
+
             if knowledge_context:
+
                 history.append(
                     {
                         "role": "system",
                         "content": (
-                            "Use the following internal knowledge as context when relevant. "
-                            "If the answer is not in the context, say that clearly and answer from general knowledge only.\n\n"
+                            "Use the following internal "
+                            "knowledge as context when relevant. "
+                            "If the answer is not in the context, "
+                            "say that clearly and answer from "
+                            "general knowledge only.\n\n"
                             f"{knowledge_context}"
                         )
                     }
                 )
 
+            # =================================================
+            # Add conversation history
+            # =================================================
+
             async for message in cursor:
 
                 history.append(
                     {
-                        "role": message["role"],
-                        "content": message["content"]
+                        "role":
+                            message["role"],
+
+                        "content":
+                            message["content"]
                     }
                 )
-
 
             # =================================================
             # Create assistant message ID
@@ -886,6 +1142,12 @@ async def websocket_endpoint(
                 generate_id()
             )
 
+            ACTIVE_STREAMS[
+                assistant_message_id
+            ] = {
+                "cancelled": False,
+                "task": None
+            }
 
             # =================================================
             # Notify UI
@@ -895,37 +1157,46 @@ async def websocket_endpoint(
                 websocket,
                 "message_start",
                 assistant_message_id,
-                role="assistant"
+                role="assistant",
+                request_id=request_id,
             )
-
 
             assistant_response = ""
 
+            # =================================================
+            # LLM
+            # =================================================
 
             try:
 
-                # =================================================
-                # Call LLM
-                # =================================================
+                async def run_llm_call() -> Any:
 
-                logger.info(
-                    "Calling model=%s stream=%s",
-                    OPENAI_MODEL,
-                    OPENAI_STREAM
-                )
-
-
-                response = await (
-                    llm_client
-                    .chat
-                    .completions
-                    .create(
-                        model=OPENAI_MODEL,
-                        messages=history,
-                        stream=OPENAI_STREAM
+                    logger.info(
+                        "Calling model=%s stream=%s",
+                        OPENAI_MODEL,
+                        OPENAI_STREAM
                     )
+
+                    return await (
+                        llm_client
+                        .chat
+                        .completions
+                        .create(
+                            model=OPENAI_MODEL,
+                            messages=history,
+                            stream=OPENAI_STREAM
+                        )
+                    )
+
+                task = asyncio.create_task(
+                    run_llm_call()
                 )
 
+                ACTIVE_STREAMS[
+                    assistant_message_id
+                ]["task"] = task
+
+                response = await task
 
                 # =================================================
                 # STREAMING
@@ -935,9 +1206,27 @@ async def websocket_endpoint(
 
                     async for chunk in response:
 
-                        if not chunk.choices:
-                            continue
+                        if (
+                            ACTIVE_STREAMS
+                            .get(
+                                assistant_message_id,
+                                {}
+                            )
+                            .get("cancelled")
+                        ):
 
+                            await send_event(
+                                websocket,
+                                "generation_stopped",
+                                assistant_message_id,
+                                status="stopped",
+                            )
+
+                            break
+
+                        if not chunk.choices:
+
+                            continue
 
                         content_chunk = (
                             chunk
@@ -946,54 +1235,92 @@ async def websocket_endpoint(
                             .content
                         )
 
-
                         if not content_chunk:
-                            continue
 
+                            continue
 
                         assistant_response += (
                             content_chunk
                         )
-
 
                         await send_event(
                             websocket,
                             "message_delta",
                             assistant_message_id,
                             delta=content_chunk,
-                            format="markdown"
+                            format="markdown",
+                            request_id=request_id,
                         )
 
+                    # ------------------------------------------------
+                    # Generation cancelled
+                    # ------------------------------------------------
 
-                    # ---------------------------------------------
+                    if (
+                        ACTIVE_STREAMS
+                        .get(
+                            assistant_message_id,
+                            {}
+                        )
+                        .get("cancelled")
+                    ):
+
+                        ACTIVE_STREAMS.pop(
+                            assistant_message_id,
+                            None
+                        )
+
+                        await send_event(
+                            websocket,
+                            "message_end",
+                            assistant_message_id,
+                            status="stopped",
+                            request_id=request_id,
+                        )
+
+                        continue
+
+                    # ------------------------------------------------
                     # Persist assistant response
-                    # ---------------------------------------------
+                    # ------------------------------------------------
 
                     assistant_message = {
-                        "id": assistant_message_id,
+
+                        "id":
+                            assistant_message_id,
+
                         "conversation_id":
                             conversation_id,
-                        "role": "assistant",
+
+                        # NEW
+                        "user_id":
+                            user_id,
+
+                        "role":
+                            "assistant",
+
                         "content":
                             assistant_response,
-                        "format": "markdown",
+
+                        "format":
+                            "markdown",
+
                         "created_at":
                             timestamp()
                     }
-
 
                     await db.messages.insert_one(
                         assistant_message
                     )
 
-
-                    # ---------------------------------------------
+                    # ------------------------------------------------
                     # Update conversation
-                    # ---------------------------------------------
+                    # ------------------------------------------------
 
                     await db.conversations.update_one(
                         {
-                            "id": conversation_id
+                            "id":
+                                conversation_id
                         },
                         {
                             "$set": {
@@ -1003,17 +1330,15 @@ async def websocket_endpoint(
                         }
                     )
 
-
-                    # ---------------------------------------------
+                    # ------------------------------------------------
                     # End streaming
-                    # ---------------------------------------------
+                    # ------------------------------------------------
 
                     await send_event(
                         websocket,
                         "message_end",
                         assistant_message_id
                     )
-
 
                 # =================================================
                 # NON STREAMING
@@ -1027,7 +1352,6 @@ async def websocket_endpoint(
                             "Model returned no choices."
                         )
 
-
                     assistant_response = (
                         response
                         .choices[0]
@@ -1036,36 +1360,47 @@ async def websocket_endpoint(
                         or ""
                     )
 
-
-                    # ---------------------------------------------
+                    # ------------------------------------------------
                     # Persist assistant response
-                    # ---------------------------------------------
+                    # ------------------------------------------------
 
                     assistant_message = {
-                        "id": assistant_message_id,
+
+                        "id":
+                            assistant_message_id,
+
                         "conversation_id":
                             conversation_id,
-                        "role": "assistant",
+
+                        # NEW
+                        "user_id":
+                            user_id,
+
+                        "role":
+                            "assistant",
+
                         "content":
                             assistant_response,
-                        "format": "markdown",
+
+                        "format":
+                            "markdown",
+
                         "created_at":
                             timestamp()
                     }
-
 
                     await db.messages.insert_one(
                         assistant_message
                     )
 
-
-                    # ---------------------------------------------
+                    # ------------------------------------------------
                     # Update conversation
-                    # ---------------------------------------------
+                    # ------------------------------------------------
 
                     await db.conversations.update_one(
                         {
-                            "id": conversation_id
+                            "id":
+                                conversation_id
                         },
                         {
                             "$set": {
@@ -1075,10 +1410,9 @@ async def websocket_endpoint(
                         }
                     )
 
-
-                    # ---------------------------------------------
+                    # ------------------------------------------------
                     # Send complete response
-                    # ---------------------------------------------
+                    # ------------------------------------------------
 
                     await send_event(
                         websocket,
@@ -1088,10 +1422,9 @@ async def websocket_endpoint(
                         format="markdown"
                     )
 
-
-                    # ---------------------------------------------
+                    # ------------------------------------------------
                     # Universal end event
-                    # ---------------------------------------------
+                    # ------------------------------------------------
 
                     await send_event(
                         websocket,
@@ -1099,13 +1432,11 @@ async def websocket_endpoint(
                         assistant_message_id
                     )
 
-
             except Exception as e:
 
                 logger.exception(
                     "LLM error"
                 )
-
 
                 await send_event(
                     websocket,
@@ -1115,6 +1446,12 @@ async def websocket_endpoint(
                     message=str(e)
                 )
 
+            finally:
+
+                ACTIVE_STREAMS.pop(
+                    assistant_message_id,
+                    None
+                )
 
     except WebSocketDisconnect:
 
@@ -1122,7 +1459,6 @@ async def websocket_endpoint(
             "WebSocket disconnected: %s",
             conversation_id
         )
-
 
     except Exception as e:
 
